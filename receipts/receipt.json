@@ -1,0 +1,15 @@
+{
+  "mode": "triton-interpreter",
+  "kernel_vs_reference_max_abs_err_fp16": 0.00390625,
+  "bytes_per_layer_site": {
+    "unfused_bytes": 49152,
+    "fused_bytes": 32768,
+    "reduction": 0.333
+  },
+  "llama3_8b_decode_step_bytes": {
+    "unfused": 3145728,
+    "fused": 2097152,
+    "saved_bytes_per_token": 1048576,
+    "note": "weights dominate decode traffic; this is the *norm-site* share only"
+  }
+}
