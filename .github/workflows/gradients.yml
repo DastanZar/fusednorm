@@ -1,0 +1,14 @@
+name: gradients
+on: {push: {branches: [main]}, pull_request: {}}
+jobs:
+  autograd-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install triton -e ".[dev]"
+      - run: pytest tests/test_backward.py -q   # the headline guarantee
+      - run: pytest -q && python demos/demo.py
+      - uses: actions/upload-artifact@v4
+        with: {name: receipts, path: receipts/}

@@ -1,36 +1,70 @@
-# fusednorm — the last 3 HBM passes of RMSNorm, gone
+# fusednorm — one kernel, in and out
 
-**One-sentence pitch:** an RMSNorm+residual epilogue has arithmetic intensity near zero, so its runtime *is* its DRAM traffic — fusing three PyTorch kernels into one Triton kernel cuts the traffic from 6N to 4N element-transfers and the latency with it.
+![ci](https://github.com/DastanZar/fusednorm/actions/workflows/gradients.yml/badge.svg)
 
-## TL;DR (verified)
+Fused RMSNorm+residual forward is table stakes in 2026; every inference stack
+has one. The backward is where people quietly fall off the roofline — either
+they fall back to unfused autograd (paying the full element traffic *twice*,
+once each direction) or they hand-roll the reduction algebra and get the
+correction term subtly wrong. This repo does the backward properly, binds it
+through `torch.autograd.Function`, and proves it against PyTorch's own
+gradients, because that reference cannot share my bugs.
 
-| | HBM traffic (per [n, hidden] call) | Kernel count |
-|---|---|---|
-| Unfused PyTorch | 6N·dtype_bytes | 3 |
-| **fused Triton** | **4N·dtype_bytes (−33%)** | 1 |
+## The traffic picture (the claim you can check with your eyes)
 
-- Kernel ↔ unfused-reference parity: max abs err **0.0039 = one fp16 ULP** (fp32-accumulate identical math)
-- Scaled to llama-3-8B decode: **0.5 MB/token saved** at the two norm sites × 32 layers (weights still dominate, but every byte counts at the memory-bound limit)
+![traffic map](assets/traffic_map.png)
 
-```mermaid
-flowchart LR
-    subgraph unfused [unfused: 3 kernels, 6N traffic]
-        A1[x] --> N1[norm kernel] --> A2[x_norm] --> M1[mul w] --> A3[y'] --> AD[add r] --> Y1[y]
-    end
-    subgraph fused [fused: 1 kernel, 4N traffic]
-        A4[x, r, w] --> K[registers: sumsq -> rsqrt -> scale -> add] --> Y2[y]
-    end
+Forward: `6N → 4N` element transfers (x, r, w in; y out). Backward adds the
+interesting part — one program per row emits *both* `dx` and a `dw` partial
+from a single `tl.sum` reduction:
+
+![bwd graph](assets/bwd_graph.png)
+
+`hbm_bytes(backward=True)` computes the ratio: 16N unfused vs 10N fused,
+**37.5% cut** — and it's a pure function of the pass structure, which is
+exactly the kind of claim you want unit-tested.
+
+## Proof, not vibes
+
+- `test_backward_parity_all_grads` (×3 hidden sizes): dx, dr, dw each checked
+  against `torch.autograd.grad` on the equivalent pure-torch composition.
+  dr must be *bit-identical* to dy — it's the residual identity path, and if
+  your "fused" backward makes dr approximate, you wrote the graph wrong.
+- `test_backward_matches_chain_rule_symbolically`: for w=1 the kernel's dx
+  must equal the analytic jacobian-vector product in fp64, < 2e-5 rel.
+- `test_training_step_end_to_end`: 20 real SGD steps through the fused
+  function, monotone descent, tracking the fp32 reference trajectory within
+  2%. The kernel trains something.
+
+![training descent](assets/training_descent.gif)
+
+Forward parity: **max abs err = one fp16 ULP** (0.0039) vs the fp32-accumulated
+reference — checked in `demos/demo.py`.
+
+## API
+
+```python
+import torch
+from fusednorm import rmsnorm_residual_autograd
+
+y = rmsnorm_residual_autograd(x, residual, weight)   # fused fwd
+y.backward(dy)                                       # fused bwd: dx, dr, dw
 ```
-
-## Why
-
-A norm does ~4 FLOPs per element against ~6 element-transfers unfused — AI ≈ 0.67, deep in the memory-bound flatland of every roofline. The fused kernel's row lives entirely in registers between the load and the single store; the only remaining traffic is the unavoidable x, r, w reads and y write. The `hbm_bytes()` counter in the API makes the 6N→4N claim checkable without a profiler.
-
-## Quickstart
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -q        # 4 tests: parity (1-ULP), byte-model, functional form
-python demos/demo.py    # parity + per-model savings receipt
+pip install -e ".[dev]" && pytest -q    # 10 tests
+python demos/demo.py && python demos/make_figures.py
 ```
-On CUDA the kernel compiles natively (`BLOCK` swept by `benchmarks/`); on CPU it runs via the Triton interpreter with identical numerics.
+
+## Why dw uses partials instead of atomics
+
+`dw` sums across rows — the naive fused move is `tl.atomic_add` per row, which
+serializes on hot buckets. We emit an `[n, hidden]` fp32 partial buffer and
+one torch reduction instead: memory for a partial, no determinism worries,
+and the extra `2N` bytes vanish against the 6N you just saved. (This trade is
+arguable on real silicon — the partial-buffer path is the one with tests.)
+
+Prior art: RMSNorm (Zhang & Sennrich 2019); fused layer-norm backward algebra
+(least-reduction form) from Apex/OneFlow-era literature. The fused-forward
+alone is commodity — the *autograd-bound backward with parity vs autograd as
+the test oracle* is the contribution.
