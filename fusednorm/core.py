@@ -66,58 +66,68 @@ def hbm_bytes(n: int, hidden: int, dtype_bytes: int = 2, backward: bool = False)
 
 if HAS_TRITON:
 
-    # NOTE: configs below are the GPU tuning space (BLOCK, num_warps). On the
-    # CPU-interpreter path we select BLOCK directly; benchmarks/ sweeps on CUDA.
+    # Kernel architecture: ROW-TILE. Each program owns a [ROWS, BLOCK] tile of
+    # the input — rows and columns are a single 2D index expression, the
+    # per-row reductions run along axis=1, and the residual/weight broadcast
+    # along axis=0. One program launch per ROWS rows amortizes launch overhead
+    # across the batch (the CPU-interpreter path picks ROWS=2; the GPU tuning
+    # sweep in benchmarks/ explores the full ROWS/warps space). Traffic stays
+    # single-pass: x, r, w each load exactly once per element.
     @triton.jit
     def _fused_kernel(
-        X, R, W, Y, N, eps, BLOCK: tl.constexpr,
+        X, R, W, Y, n_rows, N, eps, ROWS: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, BLOCK)
-        mask = cols < N
-        base = row * N
-        x = tl.load(X + base + cols, mask=mask, other=0.0).to(tl.float32)
-        r = tl.load(R + base + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        ms = tl.sum(x * x, axis=0) / N
-        inv = tl.rsqrt(ms + eps)
-        y = x * inv * w + r
-        tl.store(Y + base + cols, y, mask=mask)
+        rmask = rows < n_rows
+        tmask = rmask[:, None] & (cols < N)[None, :]
+        offs = rows[:, None] * N + cols[None, :]
+        x = tl.load(X + offs, mask=tmask, other=0.0).to(tl.float32)
+        res = tl.load(R + offs, mask=tmask, other=0.0).to(tl.float32)
+        wgt = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
+        # per-row sum-of-squares along axis=1, then the rsqrt scale vector
+        ssq = tl.sum(x * x, axis=1)
+        scale = tl.rsqrt(ssq / N + eps)[:, None]
+        y = x * scale * wgt[None, :] + res
+        tl.store(Y + offs, y, mask=tmask)
 
     @triton.jit
     def _fused_fwd_stats(
-        X, R, W, Y, Rrms, N, eps, BLOCK: tl.constexpr,
+        X, R, W, Y, Rrms, n_rows, N, eps, ROWS: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, BLOCK)
-        mask = cols < N
-        base = row * N
-        x = tl.load(X + base + cols, mask=mask, other=0.0).to(tl.float32)
-        r = tl.load(R + base + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        ms = tl.sum(x * x, axis=0) / N
-        inv = tl.rsqrt(ms + eps)
-        tl.store(Rrms + row, inv)
-        y = x * inv * w + r
-        tl.store(Y + base + cols, y, mask=mask)
+        rmask = rows < n_rows
+        tmask = rmask[:, None] & (cols < N)[None, :]
+        offs = rows[:, None] * N + cols[None, :]
+        x = tl.load(X + offs, mask=tmask, other=0.0).to(tl.float32)
+        res = tl.load(R + offs, mask=tmask, other=0.0).to(tl.float32)
+        wgt = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
+        ssq = tl.sum(x * x, axis=1)
+        scale = tl.rsqrt(ssq / N + eps)
+        tl.store(Rrms + rows, scale, mask=rmask)
+        y = x * scale[:, None] * wgt[None, :] + res
+        tl.store(Y + offs, y, mask=tmask)
 
     @triton.jit
     def _fused_bwd(
-        X, DY, W, DX, DWp, Rrms, N, eps, BLOCK: tl.constexpr,
+        X, DY, W, DX, DWp, Rrms, n_rows, N, eps, ROWS: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, BLOCK)
-        mask = cols < N
-        base = row * N
-        x = tl.load(X + base + cols, mask=mask, other=0.0).to(tl.float32)
-        dy = tl.load(DY + base + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-        rrms = tl.load(Rrms + row)
-        # c = <dy*w, x>  is the single reduction the dx correction term needs
-        c = tl.sum(dy * w * x, axis=0)
-        dx = dy * w * rrms - (rrms * rrms * rrms / N) * x * c
-        tl.store(DX + base + cols, dx, mask=mask)
-        tl.store(DWp + base + cols, dy * x * rrms, mask=mask)
+        rmask = rows < n_rows
+        tmask = rmask[:, None] & (cols < N)[None, :]
+        offs = rows[:, None] * N + cols[None, :]
+        x = tl.load(X + offs, mask=tmask, other=0.0).to(tl.float32)
+        dy = tl.load(DY + offs, mask=tmask, other=0.0).to(tl.float32)
+        wgt = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
+        scale = tl.load(Rrms + rows, mask=rmask, other=0.0)[:, None]
+        # the one reduction dx's correction term needs, per row along axis=1
+        cvec = tl.sum(dy * wgt[None, :] * x, axis=1)[:, None]
+        cube = scale * scale * scale
+        dx = dy * wgt[None, :] * scale - (cube / N) * x * cvec
+        tl.store(DX + offs, dx, mask=tmask)
+        tl.store(DWp + offs, dy * x * scale, mask=tmask)
 
 
 def pick_block(hidden: int) -> int:
@@ -125,6 +135,12 @@ def pick_block(hidden: int) -> int:
     while b < hidden:
         b *= 2
     return min(b, 16384)
+
+
+def tile_shape(n: int, hidden: int) -> tuple[int, int]:
+    """(ROWS, BLOCK) launch tile: BLOCK covers the hidden dim, ROWS packs
+    multiple rows per program (2 on the CPU-interpreter path)."""
+    return 2, pick_block(hidden)
 
 
 def _fallback_fwd(x, r, w, eps):
@@ -154,8 +170,9 @@ class _RMSNormResidualFn(torch.autograd.Function):
             return y
         y = torch.empty_like(x)
         rrms = torch.empty(n, dtype=torch.float32, device=x.device)
-        blk = pick_block(hidden)
-        _fused_fwd_stats[(n,)](x, r, w, y, rrms, hidden, eps, BLOCK=blk)
+        rows, blk = tile_shape(n, hidden)
+        _fused_fwd_stats[((n + rows - 1) // rows,)](x, r, w, y, rrms, n, hidden, eps,
+                                                    ROWS=rows, BLOCK=blk)
         ctx.save_for_backward(x, w, rrms)
         ctx.eps = eps
         return y
@@ -169,8 +186,9 @@ class _RMSNormResidualFn(torch.autograd.Function):
             return gx, gdr, gw, None
         dx = torch.empty_like(x)
         dwp = torch.empty(n, hidden, dtype=torch.float32, device=x.device)
-        blk = pick_block(hidden)
-        _fused_bwd[(n,)](x, dy, w, dx, dwp, rrms, hidden, ctx.eps, BLOCK=blk)
+        rows, blk = tile_shape(n, hidden)
+        _fused_bwd[((n + rows - 1) // rows,)](x, dy, w, dx, dwp, rrms, n, hidden,
+                                              ctx.eps, ROWS=rows, BLOCK=blk)
         # dr is the identity path: the residual add's gradient is dy itself
         return dx, dy.to(x.dtype), dwp.sum(dim=0).to(w.dtype), None
 
@@ -192,7 +210,9 @@ def fused_rmsnorm_residual(x: torch.Tensor, r: torch.Tensor, weight: torch.Tenso
     if not HAS_TRITON:
         return reference_rmsnorm_residual(x, r, weight, eps)
     y = torch.empty_like(x)
-    _fused_kernel[(n,)](x, r, weight, y, hidden, eps, BLOCK=pick_block(hidden))
+    rows, blk = tile_shape(n, hidden)
+    _fused_kernel[((n + rows - 1) // rows,)](x, r, weight, y, n, hidden, eps,
+                                             ROWS=rows, BLOCK=blk)
     return y
 
 

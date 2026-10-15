@@ -14,9 +14,11 @@ gradients, because that reference cannot share my bugs.
 
 ![traffic map](assets/traffic_map.png)
 
-Forward: `6N → 4N` element transfers (x, r, w in; y out). Backward adds the
-interesting part — one program per row emits *both* `dx` and a `dw` partial
-from a single `tl.sum` reduction:
+Forward: `6N → 4N` element transfers (x, r, w in; y out). The kernel is a
+row-tile design — each program owns a `[ROWS, BLOCK]` tile with the per-row
+reductions along `axis=1`, amortizing launch overhead across the batch while
+keeping traffic single-pass. Backward adds the interesting part — one program
+per row emits *both* `dx` and a `dw` partial from a single `tl.sum` reduction:
 
 ![bwd graph](assets/bwd_graph.png)
 
