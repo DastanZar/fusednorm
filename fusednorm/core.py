@@ -150,11 +150,18 @@ def _fallback_fwd(x, r, w, eps):
 
 
 def _fallback_bwd(x, dy, w, eps):
-    x32 = x.detach().to(torch.float32).requires_grad_(True)
-    w32 = w.detach().to(torch.float32).requires_grad_(True)
-    y = _fallback_fwd(x32, torch.zeros_like(x32), w32, eps)[0]
-    gx, gw = torch.autograd.grad(y, (x32, w32), dy.to(torch.float32))
-    return gx, gw, dy
+    # Analytic gradients in fp32. This runs inside the custom Function's
+    # backward, where grad mode is disabled, so calling torch.autograd.grad
+    # here would build no graph and fail; mirror the fused kernel's math
+    # instead (dx = dy*w*inv - (inv^3/N)*x*sum(dy*w*x)).
+    x32 = x.to(torch.float32)
+    dy32 = dy.to(torch.float32)
+    w32 = w.to(torch.float32)
+    inv = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    cvec = (dy32 * w32 * x32).sum(dim=-1, keepdim=True)
+    dx = dy32 * w32 * inv - (inv.pow(3) / x32.shape[-1]) * x32 * cvec
+    dw = (dy32 * x32 * inv).sum(dim=0)
+    return dx.to(x.dtype), dw.to(w.dtype), dy.to(x.dtype)
 
 
 class _RMSNormResidualFn(torch.autograd.Function):
